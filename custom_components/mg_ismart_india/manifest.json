@@ -7,6 +7,10 @@
   "documentation": "https://github.com/chandraaditya/mg-ismart-india-ha",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/chandraaditya/mg-ismart-india-ha/issues",
-  "requirements": ["httpx>=0.27.0", "pycryptodome>=3.20.0"],
-  "version": "0.1.0"
+  "requirements": [
+    "asn1tools>=0.167.0",
+    "httpx>=0.27.0",
+    "pycryptodome>=3.20.0"
+  ],
+  "version": "0.2.0"
 }

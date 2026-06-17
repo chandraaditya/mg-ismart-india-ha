@@ -13,9 +13,12 @@ CONF_PASSWORD = "password"
 CONF_VIN = "vin"
 
 TAP_LOGIN_URL = "https://iov-tap.mgindia.co.in/TAP.Web/ota.mp"
+TAP_STATUS_URL = "https://iov-tap.mgindia.co.in/TAP.Web/ota.mpv21"
 GATEWAY_BASE_URL = "https://iov-gateway.mgindia.co.in/api.app/v1"
 USER_AGENT = "CER_IKE_01/2.3.0 (iPad; iOS 26.3; Scale/2.00)"
 
 UPDATE_INTERVAL = timedelta(minutes=15)
+STATUS_POLL_ATTEMPTS = 6
+STATUS_POLL_DELAY = 1
 
 PLATFORMS = ["sensor", "binary_sensor"]

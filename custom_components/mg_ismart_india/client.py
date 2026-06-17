@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from binascii import unhexlify
 from dataclasses import dataclass
 import hashlib
 import hmac
 import json
+import logging
 import re
 import time
 from typing import Any
@@ -17,7 +19,17 @@ from Crypto.Util.Padding import unpad
 import httpx
 
 from .bitcodec import BitReader, read_fixed_7bit_string, set_bits, set_fixed_7bit_string
-from .const import GATEWAY_BASE_URL, TAP_LOGIN_URL, USER_AGENT
+from .const import (
+    GATEWAY_BASE_URL,
+    STATUS_POLL_ATTEMPTS,
+    STATUS_POLL_DELAY,
+    TAP_LOGIN_URL,
+    TAP_STATUS_URL,
+    USER_AGENT,
+)
+from .tap_codec import TapCodecError, decode_status_response, encode_status_request
+
+LOGGER = logging.getLogger(__package__)
 
 LOGIN_DISPATCHER_TEMPLATE_HEX = (
     "11005600882c60c183060c183060c183060c183060c183060c183060c183060c183060c183"
@@ -44,6 +56,33 @@ class MgIndiaVehicle:
 
 
 @dataclass(frozen=True)
+class MgIndiaVehicleStatus:
+    """Normalized read-only telemetry returned by the TAP status API."""
+
+    status_time: int | None
+    last_vehicle_activity: int | None
+    battery_percent: int | None
+    range_km: float | None
+    odometer_km: float | None
+    auxiliary_battery_voltage: float | None
+    interior_temperature: int | None
+    exterior_temperature: int | None
+    locked: bool | None
+    driver_door_open: bool | None
+    passenger_door_open: bool | None
+    rear_left_door_open: bool | None
+    rear_right_door_open: bool | None
+    boot_open: bool | None
+    bonnet_open: bool | None
+    driver_window_open: bool | None
+    passenger_window_open: bool | None
+    rear_left_window_open: bool | None
+    rear_right_window_open: bool | None
+    climate_running: bool | None
+    can_bus_active: bool | None
+
+
+@dataclass(frozen=True)
 class MgIndiaSnapshot:
     """Read-only data used by Home Assistant entities."""
 
@@ -54,6 +93,7 @@ class MgIndiaSnapshot:
     service_subscription: dict[str, Any] | None
     co2_info: dict[str, Any] | None
     co2_supplement: dict[str, Any] | None
+    status: MgIndiaVehicleStatus | None
     last_update: float
 
 
@@ -76,6 +116,7 @@ class MgIndiaClient:
         self._token: str | None = None
         self._user_id: str | None = None
         self._device_id = make_device_id(self._phone)
+        self._last_vehicle_status: MgIndiaVehicleStatus | None = None
 
     @property
     def vin(self) -> str | None:
@@ -133,6 +174,12 @@ class MgIndiaClient:
         co2_supplement = await self._gateway_get_optional(
             "/navi/vehicle/co2info/supplementInfo", {"vin": vehicle.vin}
         )
+        try:
+            status = await self.vehicle_status(vehicle.vin)
+            self._last_vehicle_status = status
+        except (MgIndiaApiError, httpx.HTTPError) as err:
+            LOGGER.warning("Unable to refresh MG vehicle telemetry: %s", err)
+            status = self._last_vehicle_status
         data = feature_resp.get("data", {})
         return MgIndiaSnapshot(
             vehicle=vehicle,
@@ -142,8 +189,63 @@ class MgIndiaClient:
             service_subscription=service_subscription,
             co2_info=co2_info,
             co2_supplement=co2_supplement,
+            status=status,
             last_update=time.time(),
         )
+
+    async def vehicle_status(self, vin: str) -> MgIndiaVehicleStatus:
+        """Request current read-only vehicle telemetry from TAP."""
+
+        await self._ensure_login()
+        for login_attempt in range(2):
+            event_id = 0
+            for attempt in range(STATUS_POLL_ATTEMPTS):
+                dispatcher, status = await self._status_request(vin, event_id)
+                result = dispatcher.get("result", 0)
+                if result == 2:
+                    if login_attempt == 0:
+                        await self.login()
+                        break
+                    raise MgIndiaApiError("TAP status session is invalid")
+                if status is not None:
+                    return parse_vehicle_status(status)
+                if result not in (0, 4, 6):
+                    message = dispatcher.get("errorMessage")
+                    if isinstance(message, bytes):
+                        message = message.decode(errors="replace")
+                    raise MgIndiaApiError(message or f"TAP status error code {result}")
+                event_id = dispatcher.get("eventID", event_id)
+                if attempt + 1 < STATUS_POLL_ATTEMPTS:
+                    await asyncio.sleep(STATUS_POLL_DELAY)
+            else:
+                raise MgIndiaApiError("Vehicle status was not ready after polling")
+        raise MgIndiaApiError("Unable to refresh TAP status session")
+
+    async def _status_request(
+        self, vin: str, event_id: int
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        if self._token is None or self._user_id is None:
+            raise MgIndiaApiError("Not logged in")
+        try:
+            body = await asyncio.to_thread(
+                encode_status_request, self._user_id, self._token, vin, event_id
+            )
+        except TapCodecError as err:
+            raise MgIndiaApiError(str(err)) from err
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Content-Type": "text/plain",
+            "Accept": "*/*",
+            "Accept-Language": "en-US;q=1",
+            "APP-SIGNATURE": tap_signature(body),
+            "SIGNATURE": "1",
+        }
+        response = await self._http.post(TAP_STATUS_URL, content=body, headers=headers)
+        response.raise_for_status()
+        try:
+            return decode_status_response(response.text)
+        except TapCodecError as err:
+            raise MgIndiaApiError(str(err)) from err
 
     async def gateway_get(
         self, path: str, params: dict[str, str] | None = None
@@ -287,7 +389,9 @@ def gateway_signature(signing_path: str, current_ts: str, content_type: str) -> 
 
 
 def decrypt_gateway_body(encrypted: str, headers: httpx.Headers) -> str:
-    key = md5_hex_digest(headers["APP-SEND-DATE"] + "1" + headers["ORIGINAL-CONTENT-TYPE"])
+    key = md5_hex_digest(
+        headers["APP-SEND-DATE"] + "1" + headers["ORIGINAL-CONTENT-TYPE"]
+    )
     iv = md5_hex_digest(headers["APP-SEND-DATE"])
     cipher = AES.new(unhexlify(key), AES.MODE_CBC, unhexlify(iv))
     return unpad(cipher.decrypt(unhexlify(encrypted)), AES.block_size).decode("utf-8")
@@ -307,3 +411,68 @@ def parse_vehicle(raw: dict[str, Any]) -> MgIndiaVehicle:
         is_active=raw.get("isActivate"),
         raw=raw,
     )
+
+
+def parse_vehicle_status(raw: dict[str, Any]) -> MgIndiaVehicleStatus:
+    """Normalize protocol-513 status values into Home Assistant units."""
+
+    basic = raw.get("basicVehicleStatus", {})
+    return MgIndiaVehicleStatus(
+        status_time=positive_int(raw.get("statusTime")),
+        last_vehicle_activity=positive_int(basic.get("timeOfLastCANBUSActivity")),
+        battery_percent=bounded_int(basic.get("fuelLevelPrc"), 0, 100),
+        range_km=tenths(basic.get("fuelRange")),
+        odometer_km=tenths(basic.get("mileage")),
+        auxiliary_battery_voltage=tenths(basic.get("batteryVoltage")),
+        interior_temperature=valid_temperature(basic.get("interiorTemperature")),
+        exterior_temperature=valid_temperature(basic.get("exteriorTemperature")),
+        locked=optional_bool(basic.get("lockStatus")),
+        driver_door_open=optional_bool(basic.get("driverDoor")),
+        passenger_door_open=optional_bool(basic.get("passengerDoor")),
+        rear_left_door_open=optional_bool(basic.get("rearLeftDoor")),
+        rear_right_door_open=optional_bool(basic.get("rearRightDoor")),
+        boot_open=optional_bool(basic.get("bootStatus")),
+        bonnet_open=optional_bool(basic.get("bonnetStatus")),
+        driver_window_open=optional_bool(basic.get("driverWindow")),
+        passenger_window_open=optional_bool(basic.get("passengerWindow")),
+        rear_left_window_open=optional_bool(basic.get("rearLeftWindow")),
+        rear_right_window_open=optional_bool(basic.get("rearRightWindow")),
+        climate_running=(basic.get("remoteClimateStatus") == 2)
+        if basic.get("remoteClimateStatus") is not None
+        else None,
+        can_bus_active=optional_bool(basic.get("canBusActive")),
+    )
+
+
+def positive_int(value: Any) -> int | None:
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        else None
+    )
+
+
+def bounded_int(value: Any, minimum: int, maximum: int) -> int | None:
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and minimum <= value <= maximum
+    ):
+        return value
+    return None
+
+
+def tenths(value: Any) -> float | None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return round(value / 10, 1)
+
+
+def valid_temperature(value: Any) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool) or value in (-128, -40):
+        return None
+    return value if -50 <= value <= 80 else None
+
+
+def optional_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
